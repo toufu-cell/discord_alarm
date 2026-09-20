@@ -1,0 +1,10 @@
+.env
+.dev.vars*
+.wrangler/
+.venv/
+node_modules/
+dist/
+data/
+backups/
+*.log
+.DS_Store
