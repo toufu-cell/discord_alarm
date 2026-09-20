@@ -169,6 +169,7 @@ async function handleControl(request: ControlRequest): Promise<ControlResponse> 
                 throw error;
             }
             if (result.kind === "saved" || result.kind === "replayed") {
+                if (result.kind === "saved") runtime!.notifyReservation(result.alarm);
                 return { ok: true, code: result.kind, ...running, saved: true, accepted: true,
                     alarm: result.alarm };
             }

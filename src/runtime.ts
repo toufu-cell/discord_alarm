@@ -15,6 +15,7 @@ import type { SnoozeResult } from "./database.ts";
 import { RemoteMutationUncertainError } from "./remote-repository.ts";
 import type { AlarmOperations } from "./interaction-handler.ts";
 import type { PlaybackController } from "./playback.ts";
+import { formatAlarmDate } from "./time.ts";
 
 interface PendingAlarm {
     id: string;
@@ -93,6 +94,12 @@ export class AlarmRuntime implements AlarmOperations {
 
     public get isConnected(): boolean {
         return this.connected && this.client.isReady();
+    }
+
+    public notifyReservation(alarm: AlarmRecord): void {
+        void this.notify(alarm,
+            `予約を確定しました。\n日時: ${formatAlarmDate(alarm.scheduledAtMs, alarm.timeZone)} (${alarm.timeZone})\n`
+            + `曲: ${alarm.videoTitle}\n動画: ${alarm.videoUrl}`);
     }
 
     public async start(recovered: AlarmRecord[]): Promise<void> {

@@ -37,6 +37,7 @@ const voiceConnector: VoiceConnector<BaseGuildVoiceChannel> = {
 
 export function attachFakeDiscord(client: Client): PlaybackController<BaseGuildVoiceChannel> {
     Object.assign(client, { isReady: () => true });
+    const pendingNotifications: Array<() => void> = [];
     if (process.send) {
         process.on("message", (message: unknown) => {
             if (!message || typeof message !== "object") return;
@@ -48,6 +49,8 @@ export function attachFakeDiscord(client: Client): PlaybackController<BaseGuildV
                 (client as unknown as EventEmitter).emit(Events.ShardReady, 0);
             } else if (request.alarmTestEvent === "ShardResume") {
                 client.emit(Events.ShardResume, 0, 0);
+            } else if (request.alarmTestEvent === "NotificationRelease") {
+                for (const release of pendingNotifications.splice(0)) release();
             } else return;
             setImmediate(() => process.send?.({ alarmTestEventDone: request.requestId }));
         });
@@ -66,13 +69,23 @@ export function attachFakeDiscord(client: Client): PlaybackController<BaseGuildV
         } }) } }),
     });
     Object.assign(client.channels, {
-        fetch: async () => ({
+        fetch: async (channelId: string) => ({
             isSendable: () => true,
-            send: async (message: { content: string }) => {
+            send: async (message: { content: string; allowedMentions: { parse: string[] } }) => {
+                if (process.env.ALARM_TEST_NOTIFICATION_HOLD === "1" && process.send) {
+                    await new Promise<void>((resolve) => {
+                        pendingNotifications.push(resolve);
+                        process.send?.({ alarmTestNotificationPending: true });
+                    });
+                }
                 const delay = Number(process.env.ALARM_TEST_NOTIFICATION_DELAY_MS ?? "0");
                 if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+                if (process.env.ALARM_TEST_NOTIFICATION_FAIL === "1") {
+                    throw new Error("fake notification failure");
+                }
                 const path = process.env.ALARM_TEST_NOTIFICATION_FILE;
-                if (path) appendFileSync(path, JSON.stringify({ content: message.content }) + "\n");
+                if (path) appendFileSync(path, JSON.stringify({ channelId, content: message.content,
+                    allowedMentions: message.allowedMentions }) + "\n");
             },
         }),
     });

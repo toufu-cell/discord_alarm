@@ -27,6 +27,8 @@
 
 `prepare`の結果を利用者へ示し、確定指示の後に同じ`proposalId`で`confirm`します。案の有効期間は2分です。日時が過ぎた場合や元の予約が変わった場合は、新しい案を作って再確認します。確定済みの`proposalId`を再送しても、元の予約IDを返します。
 
+新しい予約を確定すると、予約案に保存した通知先へ、予約日時、タイムゾーン、曲名、動画URLをDiscordで送信します。同じ`proposalId`の再送では通知を追加しません。`confirm`の`saved:true`は予約の保存成功を示し、通知の到着を保証しません。送信に失敗した場合も予約は残り、`status`の`active.notificationError`で確認できます。Botの異常終了をまたぐ通知の再送は行いません。
+
 変更操作の前に`status`を実行し、返された`operationId`を`--operation-id`へ渡します。`cancel`の対象は同じ結果の`active.id`です。`snooze`の対象は`audio.runId`です。`stop`は再生中なら`audio.runId`を使います。試聴の準備中で`runId`がまだない場合だけ、`--target-id preview`を使います。`exit`も`status.operationId`を使います。結果不明時の`result`と再送には、最初の操作IDと対象IDをそのまま使います。対象IDを固定した操作結果はSQLiteへ保存されます。別の対象へ同じ操作IDを使うと`operation_conflict`を返します。
 
 ## JSONと終了コード

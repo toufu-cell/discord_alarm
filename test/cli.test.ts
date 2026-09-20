@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { createConnection } from "node:net";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,7 +11,7 @@ import { test } from "node:test";
 import { AlarmRepository } from "../src/database.ts";
 import { controlPath, sendControl } from "../src/local-control.ts";
 import { ProcessLock } from "../src/process-lock.ts";
-import { explicitOccurrence } from "../src/time.ts";
+import { explicitOccurrence, formatAlarmDate } from "../src/time.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const executable = join(root, "bin/alarm");
@@ -59,12 +60,13 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 5_00
     assert.fail("期限内に状態が変わりませんでした。");
 }
 
-function proposal(repository: AlarmRepository, at = Date.now() + 86_400_000) {
+function proposal(repository: AlarmRepository, at = Date.now() + 86_400_000,
+    notificationChannelId = channelId) {
     const id = randomUUID();
     const alarmId = randomUUID();
     repository.saveProposal({ id, expiresAtMs: Date.now() + 60_000,
         alarm: { id: alarmId, scheduledAtMs: at, timeZone: "Asia/Tokyo",
-            notificationChannelId: channelId, ...video, createdAtMs: Date.now() }, expected: null });
+            notificationChannelId, ...video, createdAtMs: Date.now() }, expected: null });
     return { id, alarmId };
 }
 
@@ -81,9 +83,9 @@ function asynchronousCli(env: NodeJS.ProcessEnv, ...args: string[]): Promise<{ c
     });
 }
 
-async function startBot(env: NodeJS.ProcessEnv): Promise<ChildProcess> {
+async function startBot(env: NodeJS.ProcessEnv, ipc = false): Promise<ChildProcess> {
     const child = spawn(process.execPath, [join(root, "src/index.ts"), "--await-confirm"], {
-        cwd: root, env, stdio: "ignore",
+        cwd: root, env, stdio: ipc ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
     });
     await waitFor(async () => {
         try {
@@ -110,7 +112,8 @@ function rawControl(path: string, payload: string): Promise<Record<string, unkno
     });
 }
 
-function fakeGatewayEvent(child: ChildProcess, event: "ClientReady" | "ShardReady" | "ShardResume") {
+function fakeGatewayEvent(child: ChildProcess,
+    event: "ClientReady" | "ShardReady" | "ShardResume" | "NotificationRelease") {
     return new Promise<void>((resolve, reject) => {
         const requestId = randomUUID();
         const timeout = setTimeout(() => finish(new Error("接続イベントの応答がありません。")), 3_000);
@@ -459,6 +462,89 @@ test("明示した通知先の案は環境変数なしで確定と再開がで�
         f.cli("exit", "--operation-id", randomUUID());
         await waitFor(() => f.cli("status").result.running === false);
     } finally { f.cleanup(); }
+});
+
+test("予約確定のDiscord通知は保存先へ一度だけ送り、取消と終了まで送信を待つ", async () => {
+    for (const action of ["cancel", "exit"] as const) {
+        const f = fixture(true);
+        const noticePath = join(f.directory, "reservation-notice.jsonl");
+        f.env.ALARM_TEST_NOTIFICATION_FILE = noticePath;
+        f.env.ALARM_TEST_NOTIFICATION_HOLD = "1";
+        const destinationId = "555555555555555555";
+        const repository = new AlarmRepository(f.databasePath);
+        const item = proposal(repository, Date.now() + 86_400_000, destinationId);
+        repository.close();
+        const child = await startBot(f.env, true);
+        try {
+            const pending = once(child, "message", { signal: AbortSignal.timeout(3_000) });
+            const saved = await sendControl(controlPath(f.databasePath), {
+                action: "confirm", proposalId: item.id,
+            });
+            assert.equal(saved.code, "saved");
+            assert.equal(saved.saved, true);
+            assert.deepEqual((await pending)[0], { alarmTestNotificationPending: true });
+            assert.equal(existsSync(noticePath), false);
+            const replay = await sendControl(controlPath(f.databasePath), {
+                action: "confirm", proposalId: item.id,
+            });
+            assert.equal(replay.code, "replayed");
+            const completed = await sendControl(controlPath(f.databasePath), action === "cancel"
+                ? { action: "cancel", operationId: randomUUID(), targetId: item.alarmId }
+                : { action: "exit", operationId: randomUUID() });
+            assert.equal(completed.code, action === "cancel" ? "cancelled" : "exiting");
+            assert.equal(existsSync(noticePath), false);
+            await fakeGatewayEvent(child, "NotificationRelease");
+            child.disconnect();
+            await waitFor(() => child.exitCode !== null);
+            assert.equal(child.exitCode, 0);
+            const notices = readFileSync(noticePath, "utf8").trim().split("\n")
+                .map((line) => JSON.parse(line) as { channelId: string; content: string;
+                    allowedMentions: { parse: string[] } });
+            assert.equal(notices.length, 1);
+            assert.equal(notices[0]!.channelId, destinationId);
+            assert.deepEqual(notices[0]!.allowedMentions, { parse: [] });
+            const alarm = saved.alarm as { scheduledAtMs: number; timeZone: string };
+            assert.equal(notices[0]!.content,
+                `予約を確定しました。\n日時: ${formatAlarmDate(alarm.scheduledAtMs, alarm.timeZone)}`
+                + ` (${alarm.timeZone})\n曲: ${video.videoTitle}\n動画: ${video.videoUrl}`);
+        } finally {
+            if (child.connected) child.disconnect();
+            if (child.exitCode === null) child.kill();
+            f.cleanup();
+        }
+    }
+});
+
+test("予約通知の送信失敗は予約を残してnotificationErrorへ記録する", async () => {
+    const f = fixture(true);
+    f.env.ALARM_TEST_NOTIFICATION_FAIL = "1";
+    const repository = new AlarmRepository(f.databasePath);
+    const item = proposal(repository);
+    repository.close();
+    const child = await startBot(f.env);
+    try {
+        const saved = await sendControl(controlPath(f.databasePath), {
+            action: "confirm", proposalId: item.id,
+        });
+        assert.equal(saved.code, "saved");
+        await waitFor(() => {
+            const inspect = new AlarmRepository(f.databasePath);
+            try { return inspect.getActive()?.notificationError === "Discord通知の送信に失敗しました。"; }
+            finally { inspect.close(); }
+        });
+        const inspect = new AlarmRepository(f.databasePath);
+        assert.equal(inspect.getActive()?.id, item.alarmId);
+        assert.equal(inspect.getActive()?.status, "WAITING");
+        inspect.close();
+        const exited = await sendControl(controlPath(f.databasePath), {
+            action: "exit", operationId: randomUUID(),
+        });
+        assert.equal(exited.code, "exiting");
+        await waitFor(() => child.exitCode !== null);
+    } finally {
+        if (child.exitCode === null) child.kill();
+        f.cleanup();
+    }
 });
 
 test("終了中の確定は未受理となり、CLIは終了後に保存して起動する", async () => {
