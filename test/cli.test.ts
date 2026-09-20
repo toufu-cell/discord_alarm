@@ -34,11 +34,10 @@ function fixture(validIds = false) {
     repository.cancelWaiting(Date.now());
     repository.close();
     const env: NodeJS.ProcessEnv = { ...process.env, ALARM_DATABASE_PATH: databasePath,
-        ALARM_NOTIFICATION_CHANNEL_ID: channelId, DISCORD_APPLICATION_ID: "",
+        ALARM_NOTIFICATION_CHANNEL_ID: channelId,
         DISCORD_GUILD_ID: "", DISCORD_OWNER_ID: "", DISCORD_TOKEN: "test-token",
         NODE_ENV: "test", ALARM_TEST_GATEWAY: "1", PATH: "/nonexistent" };
     if (validIds) {
-        env.DISCORD_APPLICATION_ID = "111111111111111111";
         env.DISCORD_GUILD_ID = "222222222222222222";
         env.DISCORD_OWNER_ID = "444444444444444444";
     }
@@ -83,8 +82,9 @@ function asynchronousCli(env: NodeJS.ProcessEnv, ...args: string[]): Promise<{ c
     });
 }
 
-async function startBot(env: NodeJS.ProcessEnv, ipc = false): Promise<ChildProcess> {
-    const child = spawn(process.execPath, [join(root, "src/index.ts"), "--await-confirm"], {
+async function startBot(env: NodeJS.ProcessEnv, ipc = false, awaitConfirm = true): Promise<ChildProcess> {
+    const child = spawn(process.execPath, [join(root, "src/index.ts"),
+        ...(awaitConfirm ? ["--await-confirm"] : [])], {
         cwd: root, env, stdio: ipc ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
     });
     await waitFor(async () => {
@@ -113,7 +113,8 @@ function rawControl(path: string, payload: string): Promise<Record<string, unkno
 }
 
 function fakeGatewayEvent(child: ChildProcess,
-    event: "ClientReady" | "ShardReady" | "ShardResume" | "NotificationRelease") {
+    event: "ClientReady" | "ShardReady" | "ShardResume" | "NotificationRelease"
+        | "ButtonReplyRelease" | "ButtonDeferRelease") {
     return new Promise<void>((resolve, reject) => {
         const requestId = randomUUID();
         const timeout = setTimeout(() => finish(new Error("接続イベントの応答がありません。")), 3_000);
@@ -134,6 +135,43 @@ function fakeGatewayEvent(child: ChildProcess,
             if (error) finish(error);
         });
     });
+}
+
+interface ButtonReply {
+    content: string;
+    deferred: boolean;
+    flags: number;
+    allowedMentions: { parse: string[] };
+}
+
+function fakeButton(child: ChildProcess, buttonId: string, guildId: string, userId: string,
+    options: { holdReply?: boolean; holdDefer?: boolean } = {}) {
+    const requestId = randomUUID();
+    let resolvePending!: () => void;
+    const pending = new Promise<void>((resolve) => { resolvePending = resolve; });
+    const response = new Promise<ButtonReply>((resolve, reject) => {
+        const timeout = setTimeout(() => finish(new Error("ボタンの応答がありません。")), 5_000);
+        const onMessage = (message: unknown) => {
+            const event = message as { alarmTestButtonReplyPending?: string; alarmTestButtonDeferPending?: string;
+                alarmTestButtonResponse?: string } & ButtonReply;
+            if (event?.alarmTestButtonReplyPending === requestId
+                || event?.alarmTestButtonDeferPending === requestId) resolvePending();
+            if (event?.alarmTestButtonResponse === requestId) finish(undefined, event);
+        };
+        const onClose = () => finish(new Error("ボタンの応答前にBotが終了しました。"));
+        const finish = (error?: Error, value?: ButtonReply) => {
+            clearTimeout(timeout);
+            child.off("message", onMessage);
+            child.off("close", onClose);
+            if (error) reject(error);
+            else resolve(value!);
+        };
+        child.on("message", onMessage);
+        child.once("close", onClose);
+        child.send({ alarmTestEvent: "Button", requestId, buttonId, guildId, userId, ...options },
+            (error) => { if (error) finish(error); });
+    });
+    return { pending, response };
 }
 
 test("明示日付をタイムゾーンで解決し、CLIの確認案を別実行へ保持する", () => {
@@ -197,12 +235,11 @@ test("不正なDiscord IDと接続待ちを構造化して返す", () => {
     const item = proposal(repository);
     repository.close();
     try {
-        f.env.DISCORD_APPLICATION_ID = "invalid";
-        f.env.DISCORD_GUILD_ID = "222222222222222222";
+        f.env.DISCORD_GUILD_ID = "invalid";
         f.env.DISCORD_OWNER_ID = "444444444444444444";
         const invalid = f.cli("confirm", item.id);
         assert.equal(invalid.result.code, "invalid_configuration");
-        assert.deepEqual(invalid.result.invalidVariables, ["DISCORD_APPLICATION_ID"]);
+        assert.deepEqual(invalid.result.invalidVariables, ["DISCORD_GUILD_ID"]);
         const lock = ProcessLock.acquire(`${f.databasePath}.process-lock`);
         try {
             const status = f.cli("status");
@@ -216,7 +253,7 @@ test("不正なDiscord IDと接続待ちを構造化して返す", () => {
         const replay = f.cli("confirm", item.id);
         assert.equal(replay.result.code, "invalid_configuration");
         assert.equal(replay.result.saved, true);
-        assert.deepEqual(replay.result.invalidVariables, ["DISCORD_APPLICATION_ID"]);
+        assert.deepEqual(replay.result.invalidVariables, ["DISCORD_GUILD_ID"]);
     } finally { f.cleanup(); }
 });
 
@@ -380,7 +417,7 @@ test("接続前のBotは空なら期限で終了し、待機予約のexitとcanc
                 });
                 assert.equal(rejected.code, "starting");
                 assert.equal(rejected.accepted, false);
-                const stopped = f.cli("stop", "--operation-id", randomUUID(), "--target-id", "preview");
+                const stopped = f.cli("stop", "--operation-id", randomUUID(), "--target-id", "pending-run");
                 assert.equal(stopped.code, 3);
                 assert.equal(stopped.result.code, "starting");
                 assert.equal(stopped.result.accepted, false);
@@ -603,8 +640,6 @@ test("スキップと失敗は最後の通知後に自動終了する", async ()
         f.env.ALARM_TEST_CONFIRM_DEADLINE_MS = "500";
         f.env.ALARM_TEST_NOTIFICATION_DELAY_MS = "600";
         f.env.ALARM_TEST_NOTIFICATION_FILE = join(f.directory, "notice.jsonl");
-        f.env.ALARM_TEST_INTERACTION_DELAY_MS = "700";
-        f.env.ALARM_TEST_INTERACTION_FILE = join(f.directory, "reply.txt");
         const repository = new AlarmRepository(f.databasePath);
         repository.replaceWaiting({ id: randomUUID(), scheduledAtMs: Date.now() - 500,
             timeZone: "Asia/Tokyo", notificationChannelId: channelId,
@@ -620,8 +655,6 @@ test("スキップと失敗は最後の通知後に自動終了する", async ()
             assert.equal(inspect.getLatestResult()?.status, expectedStatus);
             inspect.close();
             assert.equal(readFileSync(f.env.ALARM_TEST_NOTIFICATION_FILE, "utf8").length > 0, true);
-            assert.equal(readFileSync(f.env.ALARM_TEST_INTERACTION_FILE, "utf8")
-                .includes("現在の予約はありません"), true);
         } finally {
             if (child.exitCode === null) child.kill();
             f.cleanup();
@@ -671,8 +704,156 @@ test("スヌーズ後は稼働を続け、停止後は通知を待って終了�
         const stopReplay = f.cli("stop", "--operation-id", stopId, "--target-id", "playing-two");
         assert.equal(stopReplay.result.code, "stopped");
         assert.deepEqual(stopReplay.result.current, { running: false, connected: false });
-        assert.equal(readFileSync(noticePath, "utf8").split("\n").filter(Boolean).length >= 2, true);
+        const notices = readFileSync(noticePath, "utf8").split("\n").filter(Boolean)
+            .map((line) => JSON.parse(line) as Record<string, unknown>);
+        assert.equal(notices.length >= 2, true);
+        assert.equal(notices.every((notice) => JSON.stringify(notice.allowedMentions) === '{"parse":[]}'), true);
     } finally { f.cleanup(); }
+});
+
+test("公開停止ボタンは対象を固定し、応答後に予約の有無で終了を決める", async () => {
+    for (const keepNext of [false, true]) {
+        const f = fixture(true);
+        f.env.ALARM_TEST_VOICE = "valid";
+        f.env.ALARM_SNOOZE_LIMIT = "0";
+        const noticePath = join(f.directory, "buttons.jsonl");
+        f.env.ALARM_TEST_NOTIFICATION_FILE = noticePath;
+        const alarmId = randomUUID();
+        const repository = new AlarmRepository(f.databasePath);
+        repository.replaceWaiting({ id: alarmId, scheduledAtMs: Date.now() + 500,
+            timeZone: "Asia/Tokyo", notificationChannelId: channelId,
+            ...video, createdAtMs: Date.now() }, null);
+        repository.close();
+        const child = await startBot(f.env, true, false);
+        try {
+            await waitFor(async () => {
+                const status = await sendControl(controlPath(f.databasePath), { action: "status" });
+                return (status.audio as { runId: string | null })?.runId === alarmId;
+            });
+            await waitFor(() => existsSync(noticePath)
+                && readFileSync(noticePath, "utf8").includes("アラームを再生しています"));
+            const notices = readFileSync(noticePath, "utf8").trim().split("\n")
+                .map((line) => JSON.parse(line) as { content: string;
+                    components?: Array<{ components: Array<{ custom_id: string; disabled?: boolean }> }> });
+            const playing = notices.find((item) => item.content.startsWith("アラームを再生しています"));
+            assert.deepEqual(playing?.components?.[0]?.components.map((button) => button.custom_id), [
+                `alarm:stop:${alarmId}`, `alarm:snooze:${alarmId}`,
+            ]);
+            assert.equal(playing?.components?.[0]?.components[1]?.disabled, true);
+
+            if (!keepNext) {
+                const otherGuild = await fakeButton(child, `alarm:stop:${alarmId}`,
+                    "999999999999999999", "555555555555555555").response;
+                assert.match(otherGuild.content, /このサーバー/);
+                const stale = await fakeButton(child, "alarm:stop:old-alarm",
+                    f.env.DISCORD_GUILD_ID!, "555555555555555555").response;
+                assert.match(stale.content, /終了しています/);
+                const inspect = new AlarmRepository(f.databasePath);
+                assert.equal(inspect.getAlarm(alarmId)?.status, "PLAYING");
+                inspect.close();
+            }
+
+            const stopping = fakeButton(child, `alarm:stop:${alarmId}`,
+                f.env.DISCORD_GUILD_ID!, "555555555555555555", { holdReply: true });
+            await stopping.pending;
+            const inspect = new AlarmRepository(f.databasePath);
+            assert.equal(inspect.getAlarm(alarmId)?.stopReason, "USER_STOPPED");
+            assert.equal(inspect.getActive(), null);
+            if (keepNext) {
+                inspect.replaceWaiting({ id: "next-alarm", scheduledAtMs: Date.now() + 86_400_000,
+                    timeZone: "Asia/Tokyo", notificationChannelId: channelId,
+                    ...video, createdAtMs: Date.now() }, null);
+            }
+            inspect.close();
+            assert.equal(child.exitCode, null);
+            assert.equal(f.cli("status").result.running, true);
+            await fakeGatewayEvent(child, "ButtonReplyRelease");
+            const reply = await stopping.response;
+            assert.match(reply.content, /停止しました/);
+            assert.equal(reply.deferred, true);
+            assert.equal(reply.flags, 64);
+            assert.deepEqual(reply.allowedMentions, { parse: [] });
+            child.disconnect();
+            if (keepNext) {
+                const status = f.cli("status").result;
+                assert.equal(status.running, true);
+                assert.equal((status.active as { id: string }).id, "next-alarm");
+                assert.equal(f.cli("exit", "--operation-id", randomUUID()).result.code, "exiting");
+            }
+            await waitFor(() => child.exitCode !== null);
+            assert.equal(child.exitCode, 0);
+        } finally {
+            if (child.connected) child.disconnect();
+            if (child.exitCode === null) child.kill();
+            f.cleanup();
+        }
+    }
+});
+
+test("公開スヌーズボタンは5分後の予約を保存し、終了中の操作を拒否する", async () => {
+    const f = fixture(true);
+    f.env.ALARM_TEST_VOICE = "valid";
+    f.env.ALARM_SNOOZE_LIMIT = "1";
+    const noticePath = join(f.directory, "buttons.jsonl");
+    f.env.ALARM_TEST_NOTIFICATION_FILE = noticePath;
+    const alarmId = randomUUID();
+    const repository = new AlarmRepository(f.databasePath);
+    repository.replaceWaiting({ id: alarmId, scheduledAtMs: Date.now() + 500,
+        timeZone: "Asia/Tokyo", notificationChannelId: channelId,
+        ...video, createdAtMs: Date.now() }, null);
+    repository.close();
+    const child = await startBot(f.env, true, false);
+    let hold: ReturnType<typeof createConnection> | null = null;
+    try {
+        await waitFor(async () => {
+            const status = await sendControl(controlPath(f.databasePath), { action: "status" });
+            return (status.audio as { runId: string | null })?.runId === alarmId;
+        });
+        await waitFor(() => existsSync(noticePath)
+            && readFileSync(noticePath, "utf8").includes("アラームを再生しています"));
+        const notices = readFileSync(noticePath, "utf8").trim().split("\n")
+            .map((line) => JSON.parse(line) as { content: string;
+                components?: Array<{ components: Array<{ disabled?: boolean }> }> });
+        const playing = notices.find((item) => item.content.startsWith("アラームを再生しています"));
+        assert.equal(playing?.components?.[0]?.components[1]?.disabled, false);
+
+        const before = Date.now();
+        const reply = await fakeButton(child, `alarm:snooze:${alarmId}`,
+            f.env.DISCORD_GUILD_ID!, "555555555555555555").response;
+        assert.match(reply.content, /5分後/);
+        assert.equal(reply.deferred, true);
+        assert.equal(reply.flags, 64);
+        const saved = new AlarmRepository(f.databasePath);
+        const active = saved.getActive();
+        assert.equal(active?.status, "WAITING");
+        assert.equal(active?.snoozeCount, 1);
+        assert.equal(active!.scheduledAtMs >= before + 5 * 60_000, true);
+        saved.close();
+        assert.equal(f.cli("status").result.running, true);
+
+        hold = createConnection(controlPath(f.databasePath));
+        await new Promise<void>((resolve, reject) => {
+            hold!.once("connect", resolve);
+            hold!.once("error", reject);
+        });
+        const ending = fakeButton(child, `alarm:stop:${alarmId}`,
+            f.env.DISCORD_GUILD_ID!, "555555555555555555", { holdDefer: true });
+        await ending.pending;
+        assert.equal(f.cli("exit", "--operation-id", randomUUID()).result.code, "exiting");
+        await fakeGatewayEvent(child, "ButtonDeferRelease");
+        const rejected = await ending.response;
+        assert.match(rejected.content, /終了処理中/);
+        hold.destroy();
+        hold = null;
+        child.disconnect();
+        await waitFor(() => child.exitCode !== null);
+        assert.equal(child.exitCode, 0);
+    } finally {
+        hold?.destroy();
+        if (child.connected) child.disconnect();
+        if (child.exitCode === null) child.kill();
+        f.cleanup();
+    }
 });
 
 test("無送信のIPCは期限で閉じ、異常入力と応答前切断でもBotは正常終了する", async () => {

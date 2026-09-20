@@ -2,14 +2,12 @@ import { resolve } from "node:path";
 
 export interface AppConfig {
     discordToken: string;
-    applicationId: string;
     guildId: string;
     ownerId: string;
     notificationChannelId: string;
     timeZone: string;
     volumePercent: number;
     snoozeLimit: number;
-    previewSeconds: number;
     databasePath: string;
     lockPath: string;
     ffmpegPath: string;
@@ -21,7 +19,7 @@ export interface AppConfig {
 }
 
 const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
-const DISCORD_ID_NAMES = ["DISCORD_APPLICATION_ID", "DISCORD_GUILD_ID", "DISCORD_OWNER_ID"] as const;
+const DISCORD_ID_NAMES = ["DISCORD_GUILD_ID", "DISCORD_OWNER_ID"] as const;
 
 export class DiscordConfigurationError extends Error {
     public readonly missingVariables: string[];
@@ -78,7 +76,6 @@ export function validateTimeZone(timeZone: string): string {
 export function missingDiscordVariables(env: NodeJS.ProcessEnv = process.env): string[] {
     return [
         "DISCORD_TOKEN",
-        "DISCORD_APPLICATION_ID",
         "DISCORD_GUILD_ID",
         "DISCORD_OWNER_ID",
     ].filter((name) => !(env[name]?.trim()));
@@ -97,28 +94,24 @@ export function loadConfig(
         }
     }
     const discordToken = requireDiscord ? env.DISCORD_TOKEN!.trim() : "";
-    const applicationId = requireDiscord ? env.DISCORD_APPLICATION_ID!.trim() : "";
     const guildId = requireDiscord ? env.DISCORD_GUILD_ID!.trim() : "";
     const ownerId = requireDiscord ? env.DISCORD_OWNER_ID!.trim() : "";
     const notificationChannelId = env.ALARM_NOTIFICATION_CHANNEL_ID?.trim() || "";
     const timeZone = validateTimeZone(env.ALARM_TIME_ZONE?.trim() || "Asia/Tokyo");
     const volumePercent = parseInteger(env.ALARM_VOLUME_PERCENT, 35, "ALARM_VOLUME_PERCENT", 1, 100);
     const snoozeLimit = parseInteger(env.ALARM_SNOOZE_LIMIT, 3, "ALARM_SNOOZE_LIMIT", 0, 10);
-    const previewSeconds = parseInteger(env.ALARM_PREVIEW_SECONDS, 30, "ALARM_PREVIEW_SECONDS", 1, 120);
     const databasePath = resolve(cwd, env.ALARM_DATABASE_PATH?.trim() || "./data/alarm.sqlite");
 
     return {
         discordToken,
-        applicationId,
         guildId,
         ownerId,
         notificationChannelId,
         timeZone,
         volumePercent,
         snoozeLimit,
-        previewSeconds,
         databasePath,
-        lockPath: env.ALARM_REMOTE_D1 === "1" ? "/tmp/discord-alarm.process-lock" : `${databasePath}.process-lock`,
+        lockPath: `${databasePath}.process-lock`,
         ffmpegPath: env.FFMPEG_PATH?.trim() || "ffmpeg",
         ytDlpPath: resolve(cwd, env.YTDLP_PATH?.trim() || "./.venv/bin/yt-dlp"),
         lateToleranceMs: 180_000,

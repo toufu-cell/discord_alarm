@@ -1,25 +1,20 @@
-import { Client, Events, GatewayIntentBits } from "discord.js";
-import { createServer, type Server } from "node:http";
+import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 import { type Server as SocketServer } from "node:net";
 import { loadConfig } from "./config.ts";
 import { AlarmRepository } from "./database.ts";
-import type { AlarmStore } from "./repository.ts";
-import { RemoteMutationUncertainError, RemoteRepository } from "./remote-repository.ts";
-import { AlarmInteractionHandler } from "./interaction-handler.ts";
+import { handlePlaybackButton, isPlaybackButton } from "./playback-buttons.ts";
 import { FfmpegMediaFactory } from "./media.ts";
 import { PlaybackController } from "./playback.ts";
 import { ProcessLock } from "./process-lock.ts";
 import { AlarmRuntime } from "./runtime.ts";
 import { DiscordVoiceConnector } from "./voice.ts";
-import { YtDlpClient } from "./youtube.ts";
 import { controlPath, removeControl, startControl, type ControlRequest, type ControlResponse } from "./local-control.ts";
 
 const config = loadConfig();
 const processLock = ProcessLock.acquire(config.lockPath);
-let repository: AlarmStore | null = null;
+let repository: AlarmRepository | null = null;
 let runtime: AlarmRuntime | null = null;
 let client: Client | null = null;
-let healthServer: Server | null = null;
 let controlServer: SocketServer | null = null;
 const localControlPath = controlPath(config.databasePath);
 let controlSessions = 0;
@@ -35,15 +30,6 @@ const awaitConfirmDeadline = Date.now() + (process.env.NODE_ENV === "test"
     ? Number(process.env.ALARM_TEST_CONFIRM_DEADLINE_MS ?? "20000") : 20_000);
 let exitRequested = false;
 let shuttingDown = false;
-let remoteUncertain = false;
-
-function failClosed(): void {
-    if (remoteUncertain) return;
-    remoteUncertain = true;
-    void runtime?.shutdown();
-    const timer = setTimeout(() => void shutdown(1), 3_000);
-    timer.unref();
-}
 
 async function shutdown(exitCode: number): Promise<void> {
     if (shuttingDown) return;
@@ -53,7 +39,6 @@ async function shutdown(exitCode: number): Promise<void> {
         await runtime?.shutdown();
     } finally {
         try {
-            healthServer?.close();
             if (controlServer) {
                 controlServer.close();
                 removeControl(localControlPath);
@@ -71,8 +56,7 @@ async function shutdown(exitCode: number): Promise<void> {
 }
 
 function scheduleIdle(): void {
-    if (process.env.ALARM_REMOTE_D1 === "1" || shuttingDown
-        || (clientReady && !controlReady && !exitRequested)) return;
+    if (shuttingDown || (clientReady && !controlReady && !exitRequested)) return;
     const idleAt = receivedControl || exitRequested ? Date.now() + 300 : awaitConfirmDeadline;
     const dueAt = controlReady ? idleAt : Math.max(idleAt, preReadyRetryAt);
     if (idleTimer && idleDueAt <= dueAt) return;
@@ -142,7 +126,6 @@ async function handleControl(request: ControlRequest): Promise<ControlResponse> 
     const running = { running: true, connected: runtime!.isConnected };
     if (shuttingDown) return { ok: false, code: "unavailable", ...running };
     if (request.action === "result") {
-        if (!(store instanceof AlarmRepository)) return { ok: false, code: "unsupported", ...running };
         const operation = store.getOperation(request.operationId);
         if (!operation) return { ok: false, code: "missing_result", ...running };
         if (operation.result === null) return { ok: false, code: "result_unknown", ...running,
@@ -159,7 +142,6 @@ async function handleControl(request: ControlRequest): Promise<ControlResponse> 
             if (exitRequested) return { ok: false, code: "exiting", ...running, accepted: false };
             if (!controlReady) return { ok: false, code: "starting", ...running,
                 saved: false, accepted: false };
-            if (!(store instanceof AlarmRepository)) return { ok: false, code: "unsupported", ...running };
             confirmationsAwaitingReply += 1;
             let result;
             try {
@@ -181,7 +163,6 @@ async function handleControl(request: ControlRequest): Promise<ControlResponse> 
         case "stop":
         case "snooze":
         case "exit": {
-            if (!(store instanceof AlarmRepository)) return { ok: false, code: "unsupported", ...running };
             const targetId = request.action === "exit" ? "bot" : request.targetId;
             const previous = store.getOperation(request.operationId);
             if (previous) {
@@ -238,8 +219,7 @@ async function handleControl(request: ControlRequest): Promise<ControlResponse> 
 }
 
 try {
-    repository = process.env.ALARM_REMOTE_D1 === "1"
-        ? new RemoteRepository(failClosed) : new AlarmRepository(config.databasePath);
+    repository = new AlarmRepository(config.databasePath);
     // 起動時の中断処理は排他ロックを取得した後にだけ実行する。
     const interrupted = await repository.recoverInterrupted(Date.now());
     client = new Client({
@@ -253,41 +233,27 @@ try {
             config.ytDlpPath, config.ffmpegPath, config.volumePercent, config.mediaTimeoutMs,
         ), new DiscordVoiceConnector());
     runtime = new AlarmRuntime(client, config, repository, playback, Date.now, scheduleIdle);
-    const handler = new AlarmInteractionHandler(
-        config,
-        repository,
-        new YtDlpClient(config.ytDlpPath, config.mediaTimeoutMs),
-        runtime,
-    );
-
-    client.on(Events.InteractionCreate, async (interaction) => {
+    client.on(Events.InteractionCreate, (interaction) => {
+        if (!isPlaybackButton(interaction)) return;
         discordOperations += 1;
-        try {
-            if (remoteUncertain) throw new RemoteMutationUncertainError();
-            if (exitRequested) throw new Error("Botの終了処理中です。");
-            await handler.handle(interaction);
-        } catch (error) {
-            console.error("Discord操作の処理に失敗しました。");
-            if (interaction.isRepliable()) {
-                const content = exitRequested ? "Botの終了処理中です。"
-                    : error instanceof RemoteMutationUncertainError
-                    ? error.message
-                    : "操作を完了できませんでした。`/alarm show`で状態を確認してください。";
-                const payload = {
-                    content,
-                    flags: 64,
-                    allowedMentions: { parse: [] },
-                } as const;
+        void (async () => {
+            try {
+                await handlePlaybackButton(interaction, config, runtime!, () =>
+                    exitRequested || shuttingDown ? "exiting" : controlReady ? "ready" : "starting");
+            } catch {
+                console.error("Discordボタンの処理に失敗しました。");
+                const content = "操作結果を確認できませんでした。予約状態を確認してください。";
                 if (interaction.deferred && !interaction.replied) {
                     await interaction.editReply({ content, allowedMentions: { parse: [] } }).catch(() => undefined);
                 } else if (!interaction.replied) {
-                    await interaction.reply(payload).catch(() => undefined);
+                    await interaction.reply({ content, flags: MessageFlags.Ephemeral,
+                        allowedMentions: { parse: [] } }).catch(() => undefined);
                 }
+            } finally {
+                discordOperations -= 1;
+                scheduleIdle();
             }
-        } finally {
-            discordOperations -= 1;
-            scheduleIdle();
-        }
+        })();
     });
     client.once(Events.ClientReady, async (readyClient) => {
         if (shuttingDown || exitRequested) return;
@@ -301,16 +267,6 @@ try {
             if (shuttingDown || exitRequested) return;
             controlReady = true;
             scheduleIdle();
-            if (process.env.ALARM_REMOTE_D1 === "1") {
-                healthServer = createServer((request, response) => {
-                    response.writeHead(request.url === "/health" ? 200 : 404);
-                    response.end();
-                });
-                await new Promise<void>((resolve, reject) => {
-                    healthServer!.once("error", reject);
-                    healthServer!.listen(8080, "0.0.0.0", resolve);
-                });
-            }
         } catch {
             console.error("起動時に予約を復旧できませんでした。");
             await shutdown(1);
@@ -336,17 +292,15 @@ try {
     });
     process.once("SIGINT", () => void shutdown(0));
     process.once("SIGTERM", () => void shutdown(0));
-    if (process.env.ALARM_REMOTE_D1 !== "1") {
-        controlServer = await startControl(localControlPath, handleControl, (request, response) => {
-            if (request?.action === "confirm" && response?.ok && response.saved) {
-                confirmationsAwaitingReply -= 1;
-            }
-            scheduleIdle();
-        }, (delta) => {
-            controlSessions += delta;
-            scheduleIdle();
-        });
-    }
+    controlServer = await startControl(localControlPath, handleControl, (request, response) => {
+        if (request?.action === "confirm" && response?.ok && response.saved) {
+            confirmationsAwaitingReply -= 1;
+        }
+        scheduleIdle();
+    }, (delta) => {
+        controlSessions += delta;
+        scheduleIdle();
+    });
     scheduleIdle();
     if (fakeGateway) {
         if (process.env.ALARM_TEST_NO_READY !== "1") {

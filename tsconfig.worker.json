@@ -1,7 +1,0 @@
-{
-    "extends": "./tsconfig.json",
-    "compilerOptions": {
-        "types": ["node", "@cloudflare/workers-types"]
-    },
-    "include": ["worker/**/*.ts", "src/domain.ts", "src/remote-repository.ts", "src/repository.ts"]
-}

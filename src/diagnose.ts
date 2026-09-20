@@ -3,7 +3,6 @@ import { DatabaseSync } from "node:sqlite";
 import { generateDependencyReport } from "@discordjs/voice";
 import { discordConfigurationIssues, loadConfig } from "./config.ts";
 import { runBoundedProcess } from "./processes.ts";
-import { checkStunUdp } from "./udp-check.ts";
 
 interface CheckResult {
     name: string;
@@ -59,15 +58,6 @@ checks.push(await commandCheck(
     ["-c", "import yt_dlp_ejs; print('available')"],
     () => "利用できます。",
 ));
-if (process.argv.includes("--udp")) {
-    const ok = await checkStunUdp();
-    checks.push({
-        name: "Cloudflare STUN UDP",
-        ok,
-        detail: ok ? "固定宛先でUDP応答を確認しました。Discord音声の確認は別途必要です。"
-            : "固定宛先のUDP応答を確認できませんでした。",
-    });
-}
 try {
     await import("@snazzah/davey");
     const report = generateDependencyReport();

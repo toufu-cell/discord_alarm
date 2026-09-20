@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { createBackup, restoreBackup } from "../src/backup.ts";
 import { AlarmRepository } from "../src/database.ts";
 import { ProcessLock, ProcessLockError } from "../src/process-lock.ts";
 
@@ -116,39 +115,6 @@ test("スヌーズを同一取引で保存し、回数を復元後も引き継�
     assert.equal(reopened.getActive()?.snoozeCount, 1);
     assert.equal(reopened.getAlarm(item.id)?.stopReason, "SNOOZED");
     reopened.close();
-});
-
-test("実際のSQLiteバックアップを新しいDBに復元し、既存DBを上書きしない", async () => {
-    const source = join(fixtureDirectory, "backup-source.sqlite");
-    const backup = join(fixtureDirectory, "backup-copy.sqlite");
-    const restored = join(fixtureDirectory, "backup-restored.sqlite");
-    const repository = new AlarmRepository(source);
-    const item = alarm(1_000_000);
-    repository.replaceWaiting(item, null);
-    const pages = await createBackup(source, backup);
-    assert.ok(pages > 0);
-    repository.close();
-    restoreBackup(backup, restored);
-    const recovered = new AlarmRepository(restored);
-    assert.equal(recovered.getActive()?.scheduledAtMs, item.scheduledAtMs);
-    assert.equal(recovered.getLastVideo()?.videoId, item.videoId);
-    recovered.close();
-    assert.throws(() => restoreBackup(backup, restored), /新しいパス/);
-    assert.throws(() => restoreBackup(backup, source), /新しいパス/);
-    assert.ok(readFileSync(source).length > 0);
-});
-
-test("バックアップ作成中に同名ファイルができても上書きしない", async () => {
-    const source = join(fixtureDirectory, "backup-race-source.sqlite");
-    const destination = join(fixtureDirectory, "backup-race-destination.sqlite");
-    const repository = new AlarmRepository(source);
-    repository.replaceWaiting(alarm(1_000_000), null);
-    const backupTask = createBackup(source, destination);
-    writeFileSync(destination, "別の処理が作成したファイル");
-    await assert.rejects(backupTask, /EEXIST/);
-    assert.equal(readFileSync(destination, "utf8"), "別の処理が作成したファイル");
-    assert.equal(readdirSync(fixtureDirectory).some((name) => name.startsWith(".alarm-backup-")), false);
-    repository.close();
 });
 
 test("独立プロセスを排他し、強制終了の後にロックを再取得できる", async () => {

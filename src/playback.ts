@@ -5,7 +5,6 @@ import type { VoiceConnector, VoiceOutput } from "./voice.ts";
 
 export interface PlaybackRequest<Channel> {
     runId: string;
-    mode: "alarm" | "preview";
     channel: Channel;
     videoUrl: string;
     durationMs: number;
@@ -38,10 +37,6 @@ export class PlaybackController<Channel> {
 
     public get activeRunId(): string | null {
         return this.active?.request.runId ?? null;
-    }
-
-    public get activeMode(): "alarm" | "preview" | null {
-        return this.active?.request.mode ?? null;
     }
 
     public start(request: PlaybackRequest<Channel>): Promise<PlaybackResult> {
@@ -116,13 +111,6 @@ export class PlaybackController<Channel> {
         return true;
     }
 
-    public async stopPreviewForAlarm(): Promise<void> {
-        const active = this.active;
-        if (!active || active.request.mode !== "preview") return;
-        this.requestStop(active.request.runId, "PREEMPTED_BY_ALARM");
-        await active.completion;
-    }
-
     public completionFor(runId: string): Promise<PlaybackResult> | null {
         return this.active?.request.runId === runId ? this.active.completion : null;
     }
@@ -141,7 +129,7 @@ export class PlaybackController<Channel> {
 
         let result: PlaybackResult = {
             status: "FINISHED",
-            reason: request.mode === "preview" ? "PREVIEW_LIMIT" : "TIME_LIMIT",
+            reason: "TIME_LIMIT",
             usedFallback: false,
         };
         try {
@@ -217,7 +205,7 @@ export class PlaybackController<Channel> {
                             started = true;
                             durationTimer = setTimeout(() => {
                                 if (!signal.aborted) {
-                                    active.requestedReason = request.mode === "preview" ? "PREVIEW_LIMIT" : "TIME_LIMIT";
+                                    active.requestedReason = "TIME_LIMIT";
                                     abortController.abort();
                                 }
                             }, request.durationMs);

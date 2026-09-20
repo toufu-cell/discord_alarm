@@ -9,29 +9,17 @@
     "packageManager": "npm@11.11.0",
     "scripts": {
         "start": "node --env-file=.env src/index.ts",
-        "register": "node --env-file=.env src/register-commands.ts",
         "diagnose": "node --env-file-if-exists=.env src/diagnose.ts",
-        "backup": "node --env-file-if-exists=.env src/backup-cli.ts",
-        "restore": "node --env-file-if-exists=.env src/restore-cli.ts",
-        "export:sqlite": "node src/export-cli.ts",
-        "verify:youtube": "node --env-file-if-exists=.env src/verify-youtube.ts",
-        "bot": "node --env-file-if-exists=.env src/admin-cli.ts",
         "typecheck": "tsc --noEmit",
-        "typecheck:worker": "tsc -p tsconfig.worker.json",
-        "deploy:check": "wrangler deploy --dry-run",
         "test": "node --test --test-concurrency=1 test/*.test.ts",
-        "check": "npm run typecheck && npm run typecheck:worker && npm test"
+        "check": "npm run typecheck && npm test"
     },
     "dependencies": {
-        "@cloudflare/containers": "^0.3.7",
         "@discordjs/voice": "0.19.2",
         "discord.js": "14.27.0"
     },
     "devDependencies": {
-        "@cloudflare/workers-types": "^5.20260919.1",
         "@types/node": "24.13.6",
-        "miniflare": "^5.20260918.0-alpha",
-        "typescript": "5.9.3",
-        "wrangler": "^4.135.0"
+        "typescript": "5.9.3"
     }
 }

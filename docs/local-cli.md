@@ -1,61 +1,47 @@
-# ローカル目覚ましCLI
+# 目覚ましCLI契約
 
-`/Users/k23062kk/git/discord_alarm/bin/alarm`を絶対パスで呼びます。この実行ファイルはリポジトリの`.env`とNode.js 24を読み、実行時の作業ディレクトリと呼出元の`PATH`に依存しません。通知先は`ALARM_NOTIFICATION_CHANNEL_ID`または`prepare --channel`で指定します。予約案に通知先を保存するため、明示指定した案の`confirm`と保存済み予約の`resume`に通知先の環境変数は必要ありません。
-
-## 操作
+リポジトリの`bin/alarm`を絶対パスで呼びます。実行ファイルは自身の場所から`.env`と実装を特定し、別の作業ディレクトリからも動きます。標準出力は1行のJSONです。予約と操作結果はSQLiteへ保存します。
 
 | コマンド | 引数 | 結果 |
 | --- | --- | --- |
-| `prepare` | `--at YYYY-MM-DDTHH:mm`または`--time HH:mm`、任意で`--url URL`、`--channel ID` | 予約案をSQLiteへ保存し、`proposalId`と期限を返す |
-| `confirm` | `proposalId` | Botを必要に応じて独立起動し、Bot側で予約を確定する |
-| `status` | なし | 稼働状態、Discord接続、現在の予約、音声ID、直近の結果、変更操作用のUUIDを返す |
-| `stop` | `--operation-id UUID --target-id ID` | 指定した予約または試聴の音声を止める |
+| `prepare` | `--at YYYY-MM-DDTHH:mm`または`--time HH:mm`、任意で`--url URL`、`--channel ID` | 予約案を保存し、`proposalId`と期限を返す |
+| `confirm` | `proposalId` | Botを独立起動し、予約を確定する |
+| `status` | なし | 稼働状態、予約、音声の対象ID、直近の結果、操作用のUUIDを返す |
 | `cancel` | `--operation-id UUID --target-id ID` | 指定した待機予約を取り消す |
-| `snooze` | `--operation-id UUID --target-id ID` | 指定した進行中のアラームを5分後に移す |
-| `exit` | `--operation-id UUID` | Botを終了し、待機中の予約を保持する |
-| `result` | `operationId` | 変更操作の保存済み結果を取得する |
-| `resume` | なし | 待機中の予約を処理するBotを起動する |
-| `diagnose` | なし | 設定名と依存関係の診断結果を返す |
+| `stop` | `--operation-id UUID --target-id ID` | 指定した予約の音声を止める |
+| `snooze` | `--operation-id UUID --target-id ID` | 指定したアラームを5分後に移す |
+| `exit` | `--operation-id UUID` | 待機予約を保持してBotを終了する |
+| `resume` | なし | 待機予約を処理するBotを起動する |
+| `result` | `operationId` | 保存済みの操作結果を取得する |
+| `diagnose` | なし | 依存と設定項目の診断結果を返す |
 
-`--at`は`ALARM_TIME_ZONE`の現地日時です。日付の省略やUTCオフセットは受け付けません。`--time`は次に来る時刻を選びます。「明日」のように日付が指定された依頼には`--at`を使います。`--url`の省略時は最後に確定した曲を使います。初回はYouTube動画のURLが必要です。
+通知先は`ALARM_NOTIFICATION_CHANNEL_ID`または`prepare --channel`で指定します。`--at`は`ALARM_TIME_ZONE`の現地日時で、日付と時刻を指定します。`--time`は次に来る時刻を選びます。日付が指定された依頼には`--at`を使います。初回はYouTube動画の`--url`が必要です。以後、省略すると最後に確定した曲を使います。
 
-```sh
-/Users/k23062kk/git/discord_alarm/bin/alarm prepare --at 2026-09-21T07:00 --url 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
-/Users/k23062kk/git/discord_alarm/bin/alarm confirm <proposalId>
-/Users/k23062kk/git/discord_alarm/bin/alarm status
-```
+`prepare`の結果にある日時、曲、通知先が依頼と一致するか確認します。日時と曲が明確な予約依頼には確定の指示も含まれるため、一致していれば同じ`proposalId`で`confirm`します。案だけの依頼や必要事項が曖昧な場合は確認を待ちます。案は2分で失効します。元の予約が変わった場合や予定時刻が過ぎた場合は、新しい案を作ります。同じ`proposalId`を再送した場合は確定済みの予約を返します。
 
-`prepare`の結果を利用者へ示し、確定指示の後に同じ`proposalId`で`confirm`します。案の有効期間は2分です。日時が過ぎた場合や元の予約が変わった場合は、新しい案を作って再確認します。確定済みの`proposalId`を再送しても、元の予約IDを返します。
+確定時は予約日時、タイムゾーン、曲名、動画URLを通知します。`saved:true`は予約の保存成功を示します。通知に失敗しても予約は残り、`status`の`active.notificationError`へ記録します。
 
-新しい予約を確定すると、予約案に保存した通知先へ、予約日時、タイムゾーン、曲名、動画URLをDiscordで送信します。同じ`proposalId`の再送では通知を追加しません。`confirm`の`saved:true`は予約の保存成功を示し、通知の到着を保証しません。送信に失敗した場合も予約は残り、`status`の`active.notificationError`で確認できます。Botの異常終了をまたぐ通知の再送は行いません。
+CLIで変更する直前に`status`を実行し、返された`operationId`を`--operation-id`に渡します。`cancel`の対象は`active.id`、`stop`と`snooze`の対象は`audio.runId`です。`exit`も`status.operationId`を使います。結果不明時は最初の操作IDで`result`を呼び、再送する場合も同じ操作IDと対象IDを使います。別の対象へ同じ操作IDを使うと`operation_conflict`を返します。対象IDを指定するため、古い予約への操作は新しい予約へ作用しません。
 
-変更操作の前に`status`を実行し、返された`operationId`を`--operation-id`へ渡します。`cancel`の対象は同じ結果の`active.id`です。`snooze`の対象は`audio.runId`です。`stop`は再生中なら`audio.runId`を使います。試聴の準備中で`runId`がまだない場合だけ、`--target-id preview`を使います。`exit`も`status.operationId`を使います。結果不明時の`result`と再送には、最初の操作IDと対象IDをそのまま使います。対象IDを固定した操作結果はSQLiteへ保存されます。別の対象へ同じ操作IDを使うと`operation_conflict`を返します。
+再生中は通知の「停止して終了」と「5分スヌーズ」でも操作できます。設定サーバーで通知を見られる人なら誰でも押せます。`DISCORD_OWNER_ID`は再生先VCを探す本人のIDであり、ボタンの操作者制限には使いません。ボタンは通知した予約IDに固定され、古い通知から新しい予約へ作用しません。スヌーズ上限に達した通知ではスヌーズボタンが無効になります。応答は押した人だけに表示されます。
 
 ## JSONと終了コード
 
-標準出力は1行のJSONです。`ok`は今回の操作が成立したか、`code`は機械判定用の結果です。`running`はBotプロセス、`connected`はDiscord接続、`saved`は予約確定の結果を表します。`accepted`は変更操作をBotが受理したかを表します。`paused:true`は待機予約を保持したままBotが停止する状態です。停止中の予約は`resume`まで鳴りません。`status`の`active`は現在の予約、`latest`は直近の終了結果です。`audio`には音声の`mode`と`runId`が入ります。Bot停止中もSQLiteから`active`と`latest`を読みます。予約時刻と期限はUnix時刻のミリ秒です。
+`ok`は操作の成否、`code`は機械判定用の結果です。`running`はBotの稼働、`connected`はDiscord接続、`saved`は予約の保存、`accepted`は変更操作の受理を示します。`active`は現在の予約、`latest`は直近の終了結果です。`audio.runId`は再生中または準備中の予約IDです。`paused:true`は待機予約を保持したままBotが停止した状態です。時刻と期限はUnix時刻のミリ秒です。
 
 | 終了コード | 意味 | 主な`code` |
 | --- | --- | --- |
 | `0` | 操作成功 | `prepared`、`saved`、`replayed`、`ok`、`running`、`stopped`、`cancelled`、`exiting`、`already_stopped` |
-| `2` | 入力または現在状態により操作不成立 | `invalid_or_failed`、`invalid_input`、`missing_configuration`、`invalid_configuration`、`missing`、`expired`、`elapsed`、`stale`、`busy`、`exiting`、`operation_conflict`、`missing_result`、`no_waiting`、`no_audio`、`limit`、`failed`、`no_reservation`、`diagnostic_failed` |
-| `3` | Botの起動、接続、受付待ちを確認できない | `start_failed`、`starting` |
-| `4` | 変更結果を判断できない | `result_unknown` |
+| `2` | 入力または状態による不成立 | `invalid_or_failed`、`missing_configuration`、`invalid_configuration`、`missing`、`expired`、`elapsed`、`stale`、`busy`、`operation_conflict`、`missing_result`、`no_waiting`、`no_audio`、`limit`、`failed`、`no_reservation`、`diagnostic_failed` |
+| `3` | Botの起動または受付準備を確認できない | `start_failed`、`starting` |
+| `4` | 結果を判断できない | `result_unknown` |
 
-`status`の`starting`は接続準備中の状態取得に成功した結果として終了コード`0`です。この間も`exit`と`cancel`を受け付けます。`confirm`、`stop`、`snooze`は準備完了まで受け付けず、`accepted:false`を返します。準備が終わらない`confirm`や`resume`は終了コード`3`の`start_failed`になります。
+`status`は`active`、`latest`、`audio`、新しい`operationId`を返します。接続や復旧の準備中は`code:"starting"`でも状態取得は成功し、終了コードは`0`です。この間は`cancel`と`exit`を受け付けます。`confirm`、`stop`、`snooze`は`accepted:false`を返します。`exiting:true`は終了処理中です。
 
-`prepare`は`ok`と`code`、`proposalId`、`expiresAtMs`、`alarm`、`previous`を返します。`alarm`には予約IDと予定時刻、タイムゾーン、曲、通知先が含まれます。`confirm`の成功時は`ok`と`code`、`saved`、`running`、`connected`、`alarm`を返します。
+`confirm`の起動失敗時は保存結果をSQLiteで再確認します。`saved:true`と`start_failed`の組み合わせは、予約が保存された後にBot起動を確認できない状態です。`saved:false`は保存されていない状態です。結果が不明な場合は`saved`が省略されます。`confirm`の`result_unknown`は同じ`proposalId`で再確認します。
 
-`confirm`の起動失敗時にも提案の保存結果をSQLiteで確認します。`saved:true`と`start_failed`は予約が保存されたもののBot起動を確認できない状態です。`saved:false`は予約が保存されていない状態です。結果が不明な場合は`saved`を省略します。稼働中のBotがDiscordから切断された場合、`saved:true`と`connected:false`を同時に返すことがあります。
+`stop`、`snooze`、`cancel`、`exit`の`result_unknown`は、`result <operationId>`と`status`で確認します。保存中の操作結果がなお不明な場合は、新しい操作IDで再送せず、予約と音声の状態を確認します。`result.current`は現在の稼働状態です。`exit`は応答時点で`running:true`を返すことがあり、終了後の`status`では`running:false`になります。
 
-`status`は`active`、`latest`、`audio`、新しい`operationId`を返します。`exiting:true`は終了処理中です。接続と復旧の準備中は`running:true`、`code:"starting"`で、`connected`がDiscord接続の状態を示します。`stop`と`snooze`は操作後の`active`を返します。`cancel`は取り消した`alarm`を返します。`exit`は応答時点の`active`を返し、`resume`は起動後の状態を返します。`result`は保存時点の応答を返します。`result.current`には現在の稼働状態を返します。
+Botは呼出元から独立したプロセスグループで動きます。予約、再生、通知、ボタンへの応答が完了し、有効な予約がなくなると自動終了します。停止中に別の予約が確定した場合、その予約を保持して稼働を続けます。スヌーズ後も稼働を続けます。異常終了後の待機予約には180秒の遅延規則を適用します。待機中に`exit`した予約は`resume`で再開します。ログはSQLiteと同じディレクトリの`bot.log`に保存します。
 
-`diagnose`の`checks`は`name`、`ok`、`detail`を持つ診断結果の配列です。`missingVariables`は未設定のDiscord接続情報、`invalidVariables`は形式不正のDiscord IDを返します。通知先は`prepare`で検証します。操作対象がなければ、`active`や`alarm`は`null`か省略になります。
-
-`confirm`の`result_unknown`では、同じ`proposalId`で再確認します。`stop`、`snooze`、`cancel`、`exit`の`result_unknown`では、`result <operationId>`と`status`で結果と対象予約を確認します。保存中の操作結果がなお不明な場合、別の操作IDで変更を再送せず、予約や音声の状態を確認してください。`exiting`と`accepted:false`は未受理です。`confirm`はBotの終了を待ってから起動し直します。`exit`の応答時点では終了処理中なので、`running:true`を返す場合があります。終了後の`status`では`running:false`となり、残る待機予約は`active`に表示されます。この予約は`resume`まで鳴りません。
-
-Botは独立したプロセスグループで起動します。予約、再生、試聴、通知、操作への応答が終わり、有効な予約がなくなると自動終了します。待機予約やスヌーズが残れば稼働を続けます。異常終了後の待機予約は既存の180秒規則で復旧します。ログはSQLiteと同じディレクトリの`bot.log`へ保存します。
-
-確定要求を待つ空のBotは、Discord接続が完了しない場合も起動から20秒で終了します。待機予約が保存されているBotは接続を待ち、復旧処理を続けます。接続前の`exit`は待機予約を保持し、最後の待機予約を`cancel`するとBotは自動終了します。
-
-ローカルCLIはSQLiteを対象にします。CloudflareのD1運用と管理CLIには既存の操作方法を使います。スキルは別作業で新規作成します。
+確定要求を待つ空のBotは、Discord接続が完了しない場合も起動から20秒で終了します。待機予約があるBotは接続を待ちます。接続前の`exit`は待機予約を保持します。最後の待機予約を`cancel`するとBotは自動終了します。
