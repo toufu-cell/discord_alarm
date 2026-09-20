@@ -52,10 +52,3 @@ export async function prepareReservation(
         previous,
     };
 }
-
-export function saveReservation(
-    repository: AlarmStore,
-    reservation: Pick<PreparedReservation, "alarm" | "expected">,
-) {
-    return repository.replaceWaiting(reservation.alarm, reservation.expected);
-}

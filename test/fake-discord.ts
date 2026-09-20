@@ -38,10 +38,13 @@ const voiceConnector: VoiceConnector<BaseGuildVoiceChannel> = {
 export function attachFakeDiscord(client: Client): PlaybackController<BaseGuildVoiceChannel> {
     Object.assign(client, { isReady: () => true });
     const pendingNotifications: Array<() => void> = [];
+    const pendingButtonReplies: Array<() => void> = [];
+    const pendingButtonDefers: Array<() => void> = [];
     if (process.send) {
         process.on("message", (message: unknown) => {
             if (!message || typeof message !== "object") return;
-            const request = message as { alarmTestEvent?: string; requestId?: string };
+            const request = message as { alarmTestEvent?: string; requestId?: string;
+                buttonId?: string; guildId?: string; userId?: string; holdReply?: boolean; holdDefer?: boolean };
             if (typeof request.requestId !== "string") return;
             if (request.alarmTestEvent === "ClientReady") {
                 client.emit(Events.ClientReady, { user: { id: "test" } } as Client<true>);
@@ -51,6 +54,46 @@ export function attachFakeDiscord(client: Client): PlaybackController<BaseGuildV
                 client.emit(Events.ShardResume, 0, 0);
             } else if (request.alarmTestEvent === "NotificationRelease") {
                 for (const release of pendingNotifications.splice(0)) release();
+            } else if (request.alarmTestEvent === "ButtonReplyRelease") {
+                for (const release of pendingButtonReplies.splice(0)) release();
+            } else if (request.alarmTestEvent === "ButtonDeferRelease") {
+                for (const release of pendingButtonDefers.splice(0)) release();
+            } else if (request.alarmTestEvent === "Button"
+                && request.buttonId && request.guildId && request.userId) {
+                let deferred = false;
+                let replied = false;
+                let flags: number | undefined;
+                const sendReply = async (payload: { content: string; allowedMentions?: { parse: string[] } }) => {
+                    if (request.holdReply) {
+                        await new Promise<void>((resolve) => {
+                            pendingButtonReplies.push(resolve);
+                            process.send?.({ alarmTestButtonReplyPending: request.requestId });
+                        });
+                    }
+                    await new Promise<void>((resolve, reject) => process.send?.({
+                        alarmTestButtonResponse: request.requestId, content: payload.content,
+                        allowedMentions: payload.allowedMentions, deferred, flags,
+                    }, (error) => error ? reject(error) : resolve()));
+                    replied = true;
+                };
+                const interaction = {
+                    customId: request.buttonId, guildId: request.guildId, user: { id: request.userId },
+                    get deferred() { return deferred; }, get replied() { return replied; },
+                    isButton: () => true,
+                    deferReply: async (payload: { flags: number }) => {
+                        deferred = true;
+                        flags = payload.flags;
+                        if (request.holdDefer) {
+                            await new Promise<void>((resolve) => {
+                                pendingButtonDefers.push(resolve);
+                                process.send?.({ alarmTestButtonDeferPending: request.requestId });
+                            });
+                        }
+                    },
+                    editReply: sendReply, reply: sendReply,
+                } as unknown as Interaction;
+                client.emit(Events.InteractionCreate, interaction);
+                return;
             } else return;
             setImmediate(() => process.send?.({ alarmTestEventDone: request.requestId }));
         });
@@ -71,7 +114,7 @@ export function attachFakeDiscord(client: Client): PlaybackController<BaseGuildV
     Object.assign(client.channels, {
         fetch: async (channelId: string) => ({
             isSendable: () => true,
-            send: async (message: { content: string; allowedMentions: { parse: string[] } }) => {
+            send: async (message: { content: string; allowedMentions: { parse: string[] }; components?: unknown }) => {
                 if (process.env.ALARM_TEST_NOTIFICATION_HOLD === "1" && process.send) {
                     await new Promise<void>((resolve) => {
                         pendingNotifications.push(resolve);
@@ -85,33 +128,9 @@ export function attachFakeDiscord(client: Client): PlaybackController<BaseGuildV
                 }
                 const path = process.env.ALARM_TEST_NOTIFICATION_FILE;
                 if (path) appendFileSync(path, JSON.stringify({ channelId, content: message.content,
-                    allowedMentions: message.allowedMentions }) + "\n");
+                    allowedMentions: message.allowedMentions, components: message.components }) + "\n");
             },
         }),
     });
-    const replyFile = process.env.ALARM_TEST_INTERACTION_FILE;
-    if (replyFile) {
-        const interaction = {
-            guildId: process.env.DISCORD_GUILD_ID,
-            user: { id: process.env.DISCORD_OWNER_ID },
-            commandName: "alarm",
-            options: { getSubcommand: () => "show" },
-            deferred: false,
-            replied: false,
-            isChatInputCommand: () => true,
-            isButton: () => false,
-            isRepliable: () => true,
-            async deferReply() { this.deferred = true; },
-            async editReply(message: { content: string }) {
-                const delay = Number(process.env.ALARM_TEST_INTERACTION_DELAY_MS ?? "0");
-                if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-                appendFileSync(replyFile, message.content + "\n");
-                this.replied = true;
-            },
-        };
-        const timer = setTimeout(() => client.emit(Events.InteractionCreate,
-            interaction as unknown as Interaction), 100);
-        timer.unref();
-    }
     return new PlaybackController(mediaFactory, voiceConnector);
 }

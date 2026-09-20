@@ -86,7 +86,6 @@ test("YouTube途中エラー後は同じ回で内蔵音を使い続ける", asyn
     const started = deferred<void>();
     const completion = controller.start({
         runId: "fallback",
-        mode: "alarm",
         channel: "voice",
         videoUrl: "video",
         durationMs: 40,
@@ -114,7 +113,6 @@ test("停止後のDB保存失敗でも音声と媒体を解放する", async () 
     let saveFailed = false;
     const completion = controller.start({
         runId: "stop",
-        mode: "alarm",
         channel: "voice",
         videoUrl: "video",
         durationMs: 15 * 60_000,
@@ -141,7 +139,7 @@ test("Playing後のDB応答待ちでも終了タイマーが進み、保存失�
     const voice = createConnector();
     const controller = new PlaybackController(media.factory, voice.connector);
     const completion = controller.start({
-        runId: "slow-start-save", mode: "alarm", channel: "voice", videoUrl: "video",
+        runId: "slow-start-save", channel: "voice", videoUrl: "video",
         durationMs: 40,
         onStarted: () => { started.resolve(); return save.promise; },
     });
@@ -149,7 +147,7 @@ test("Playing後のDB応答待ちでも終了タイマーが進み、保存失�
     context.mock.timers.tick(40);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.ok(voice.outputs.every((entry) => entry.stopped && entry.closed));
-    save.reject(new Error("D1 response lost"));
+    save.reject(new Error("DB write failed"));
     const result = await completion;
     assert.equal(result.status, "FAILED");
     assert.equal(result.reason, "START_PERSISTENCE_FAILED");
@@ -184,7 +182,7 @@ test("再生開始が同期的に失敗しても音源の拒否を処理して�
     };
     const controller = new PlaybackController(media, voice);
     const result = await controller.start({
-        runId: "sync-play-error", mode: "alarm", channel: "voice", videoUrl: "video",
+        runId: "sync-play-error", channel: "voice", videoUrl: "video",
         durationMs: 1_000,
     });
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -201,7 +199,6 @@ test("スヌーズ保存に失敗したら保留中の停止要求を実行す�
     const controller = new PlaybackController(media.factory, voice.connector);
     const completion = controller.start({
         runId: "snooze",
-        mode: "alarm",
         channel: "voice",
         videoUrl: "video",
         durationMs: 15 * 60_000,
@@ -221,7 +218,7 @@ test("DB変更結果が不明なときは保留中のスヌーズも音声を止
     const voice = createConnector();
     const controller = new PlaybackController(media.factory, voice.connector);
     const completion = controller.start({
-        runId: "uncertain-snooze", mode: "alarm", channel: "voice", videoUrl: "video",
+        runId: "uncertain-snooze", channel: "voice", videoUrl: "video",
         durationMs: 15 * 60_000,
     });
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -266,7 +263,7 @@ test("YouTubeと内蔵音がPlayingに到達しなければ時間切れで失敗
     };
     const controller = new PlaybackController(media, voice);
     const completion = controller.start({
-        runId: "media-timeout", mode: "alarm", channel: "voice", videoUrl: "video",
+        runId: "media-timeout", channel: "voice", videoUrl: "video",
         durationMs: 1_000, mediaTimeoutMs: 20,
     });
     await firstPlay.promise;
@@ -324,7 +321,7 @@ test("再生出力が終了しても取得が終わらない回は内蔵音へ�
     };
     const controller = new PlaybackController(media, voice);
     const completion = controller.start({
-        runId: "stalled-data", mode: "alarm", channel: "voice", videoUrl: "video",
+        runId: "stalled-data", channel: "voice", videoUrl: "video",
         durationMs: 1_000, mediaTimeoutMs: 20,
     });
     await outputEnded.promise;
@@ -362,7 +359,7 @@ test("15分相当の制限は最初のPlayingから計測する", async (context
     const controller = new PlaybackController(media.factory, voice);
     let starts = 0;
     const completion = controller.start({
-        runId: "playing-clock", mode: "alarm", channel: "voice", videoUrl: "video",
+        runId: "playing-clock", channel: "voice", videoUrl: "video",
         durationMs: 40, mediaTimeoutMs: 200,
         onStarted: () => { starts += 1; started.resolve(); },
     });
@@ -378,35 +375,4 @@ test("15分相当の制限は最初のPlayingから計測する", async (context
     assert.equal(result.reason, "TIME_LIMIT");
     assert.equal(starts, 1);
     assert.equal(Date.now(), 1_065);
-});
-
-test("試聴が停止処理中でもアラーム側は解放完了を待つ", async () => {
-    const media = createMedia({ hang: true });
-    let releaseClose!: () => void;
-    const closing = new Promise<void>((resolve) => { releaseClose = resolve; });
-    const voice: VoiceConnector<string> = {
-        connect: async () => ({
-            play: (_stream, signal) => ({
-                started: Promise.resolve(),
-                done: new Promise<void>((_, reject) => signal.addEventListener("abort", () =>
-                    reject(new DOMException("停止", "AbortError")), { once: true })),
-            }),
-            stop: () => undefined,
-            close: async () => closing,
-        }),
-    };
-    const controller = new PlaybackController(media.factory, voice);
-    const completion = controller.start({
-        runId: "preview-1", mode: "preview", channel: "voice", videoUrl: "video", durationMs: 1_000,
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(controller.requestStop("preview-1", "USER_STOPPED"), true);
-    let released = false;
-    const preemption = controller.stopPreviewForAlarm().then(() => { released = true; });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(released, false);
-    releaseClose();
-    await preemption;
-    await completion;
-    assert.equal(released, true);
 });

@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import { ChannelType, type BaseGuildVoiceChannel, type Client, type Interaction } from "discord.js";
+import { ChannelType, type BaseGuildVoiceChannel, type Client } from "discord.js";
 import { loadConfig } from "../src/config.ts";
 import { AlarmRepository } from "../src/database.ts";
 import type { AlarmStore } from "../src/repository.ts";
 import { FfmpegMediaFactory, type MediaFactory } from "../src/media.ts";
-import { AlarmInteractionHandler } from "../src/interaction-handler.ts";
 import { PlaybackController } from "../src/playback.ts";
 import { AlarmRuntime } from "../src/runtime.ts";
 import type { VoiceConnector } from "../src/voice.ts";
@@ -63,7 +62,6 @@ function makeHarness(
     } as unknown as Client;
     const config = loadConfig({
         DISCORD_TOKEN: "unused",
-        DISCORD_APPLICATION_ID: "444444444444444444",
         DISCORD_GUILD_ID: guildId,
         DISCORD_OWNER_ID: ownerId,
     });
@@ -199,7 +197,7 @@ for (const scenario of [
                 snoozeRun: async (id, scheduledAtMs, nowMs, limit) => {
                     mutationStarted.resolve();
                     await release.promise;
-                    if (scenario.outcome === "failed") throw new Error("D1 update failed");
+                    if (scenario.outcome === "failed") throw new Error("DB write failed");
                     return repository.snoozeRun(id, scheduledAtMs, nowMs, limit);
                 },
             }),
@@ -246,7 +244,7 @@ test("再生中のスヌーズ保存失敗後に保留中の停止要求を実�
             snoozeRun: async () => {
                 mutationStarted.resolve();
                 await release.promise;
-                throw new Error("D1 update failed");
+                throw new Error("DB write failed");
             },
         }),
     });
@@ -273,34 +271,6 @@ test("再生中のスヌーズ保存失敗後に保留中の停止要求を実�
         await harness.close();
     }
 });
-
-for (const action of ["stop", "move"] as const) {
-    test(`試聴のDB読取り待ちで${action}を記録する`, async () => {
-        const reading = deferred<void>();
-        const release = deferred<void>();
-        const harness = makeHarness(async () => { throw new Error("VC検索へ進んではいけません。"); }, true,
-            Promise.resolve(), {
-                store: (repository) => withStoreMethods(repository, {
-                    getActive: async () => {
-                        reading.resolve();
-                        await release.promise;
-                        return repository.getActive();
-                    },
-                }),
-            });
-        await harness.runtime.start([]);
-        const preview = harness.runtime.startPreview(video, textChannelId);
-        await reading.promise;
-        const cancellation = action === "stop"
-            ? harness.runtime.stop("preview") : harness.runtime.ownerVoiceChanged(null);
-        release.resolve();
-        if (action === "stop") assert.equal(await cancellation, true);
-        else await cancellation;
-        assert.equal((await preview).kind, "busy");
-        assert.equal(harness.connectedCount, 0);
-        await harness.close();
-    });
-}
 
 test("未接続中は待機を保持し、復旧時の現在時刻で遅延を判定する", async () => {
     const late = makeHarness(async () => null, false);
@@ -333,137 +303,61 @@ test("Botの明示終了では将来の待機予約を保持する", async () =>
     await harness.close();
 });
 
-test("待機予約のある試聴を実ハンドラーの停止コマンドで終了する", async () => {
-    const lookup = deferred<BaseGuildVoiceChannel | null>();
-    const lookupStarted = deferred<void>();
-    const claimPending = deferred<void>();
-    const releaseClaim = deferred<void>();
-    let holdClaim = false;
-    const harness = makeHarness(() => {
-        lookupStarted.resolve();
-        return lookup.promise;
-    }, true, Promise.resolve(), {
+test("古い対象IDによる停止は現在の再生へ作用しない", async () => {
+    let voiceChannel: BaseGuildVoiceChannel;
+    const harness = makeHarness(async () => voiceChannel);
+    voiceChannel = harness.channel;
+    harness.reserve("alarm-playing");
+    try {
+        await harness.runtime.start([]);
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+            if (harness.repository.getAlarm("alarm-playing")?.status === "PLAYING") break;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        assert.equal(await harness.runtime.stop("older-run"), false);
+        assert.equal(harness.repository.getAlarm("alarm-playing")?.status, "PLAYING");
+        assert.equal(await harness.runtime.stop("alarm-playing"), true);
+        assert.equal(harness.repository.getAlarm("alarm-playing")?.stopReason, "USER_STOPPED");
+    } finally {
+        await harness.close();
+    }
+});
+
+test("本人のVC退出は音声停止と結果保存の完了を待つ", async () => {
+    const saving = deferred<void>();
+    const release = deferred<void>();
+    let voiceChannel: BaseGuildVoiceChannel;
+    const harness = makeHarness(async () => voiceChannel, true, Promise.resolve(), {
         store: (repository) => withStoreMethods(repository, {
-            claimDue: async (now, tolerance) => {
-                const result = repository.claimDue(now, tolerance);
-                if (holdClaim) {
-                    claimPending.resolve();
-                    await releaseClaim.promise;
-                }
-                return result;
+            finishRun: async (id, status, reason, nowMs, lastError) => {
+                saving.resolve();
+                await release.promise;
+                return repository.finishRun(id, status, reason, nowMs, lastError);
             },
         }),
     });
-    harness.reserve("waiting-1", 2_000_000);
-    await harness.runtime.start([]);
-    const preview = harness.runtime.startPreview(video, textChannelId);
-    await lookupStarted.promise;
-    holdClaim = true;
-    harness.setReady(true);
-    await claimPending.promise;
-    assert.equal(harness.runtime.activeAudioMode, "preview");
-    assert.equal(harness.runtime.isIdle, false);
-    const responses: string[] = [];
-    let deferredReply = false;
-    const interaction = {
-        guildId, channelId: textChannelId, user: { id: ownerId }, commandName: "alarm",
-        isChatInputCommand: () => true, isButton: () => false,
-        options: { getSubcommand: () => "stop" },
-        get deferred() { return deferredReply; }, replied: false,
-        deferReply: async () => { deferredReply = true; },
-        editReply: async (message: { content: string }) => { responses.push(message.content); },
-    } as unknown as Interaction;
-    const handler = new AlarmInteractionHandler(harness.config, harness.repository,
-        { probe: async () => video }, harness.runtime, () => 1_000_000);
-    const handling = handler.handle(interaction);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    releaseClaim.resolve();
-    await handling;
-    lookup.resolve(harness.channel);
-    assert.equal((await preview).kind, "busy");
-    assert.equal(deferredReply, true);
-    assert.match(responses[0] ?? "", /停止を受け付け/);
-    assert.equal(harness.repository.getAlarm("waiting-1")?.status, "WAITING");
-    assert.equal(harness.connectedCount, 0);
-    assert.equal(harness.runtime.isIdle, true);
-    await harness.close();
-});
-
-test("D1読取り失敗でも現在の音声を停止し、古い停止ボタンは作用しない", async () => {
-    for (const action of ["command", "button"] as const) {
-        let voiceChannel: BaseGuildVoiceChannel;
-        const harness = makeHarness(async () => voiceChannel);
-        voiceChannel = harness.channel;
-        harness.reserve("alarm-playing");
-        try {
-            await harness.runtime.start([]);
-            for (let attempt = 0; attempt < 20; attempt += 1) {
-                if (harness.repository.getAlarm("alarm-playing")?.status === "PLAYING") break;
-                await new Promise<void>((resolve) => setImmediate(resolve));
-            }
-            assert.equal(harness.repository.getAlarm("alarm-playing")?.status, "PLAYING");
-            const unavailable = withStoreMethods(harness.repository, {
-                getActive: async () => { throw new Error("D1 read failed"); },
-            });
-            const handler = new AlarmInteractionHandler(harness.config, unavailable,
-                { probe: async () => video }, harness.runtime, () => 1_000_000);
-            const stop = async (runId: string) => {
-                let deferredReply = false;
-                const responses: string[] = [];
-                const interaction = {
-                    guildId, channelId: textChannelId, user: { id: ownerId }, commandName: "alarm",
-                    customId: `alarm:stop:${runId}`,
-                    isChatInputCommand: () => action === "command", isButton: () => action === "button",
-                    options: { getSubcommand: () => "stop" },
-                    get deferred() { return deferredReply; }, replied: false,
-                    deferReply: async () => { deferredReply = true; },
-                    editReply: async (message: { content: string }) => { responses.push(message.content); },
-                } as unknown as Interaction;
-                await handler.handle(interaction);
-                assert.equal(deferredReply, true);
-                return responses[0];
-            };
-            if (action === "button") {
-                assert.match(await stop("older-run") ?? "", /終了しています/);
-                assert.equal(harness.repository.getAlarm("alarm-playing")?.status, "PLAYING");
-            }
-            assert.match(await stop("alarm-playing") ?? "", /停止を受け付け/);
-            assert.equal(harness.repository.getAlarm("alarm-playing")?.stopReason, "USER_STOPPED");
-            assert.equal(harness.repository.getActive(), null);
-        } finally {
-            await harness.close();
+    voiceChannel = harness.channel;
+    harness.reserve("owner-left");
+    try {
+        await harness.runtime.start([]);
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+            if (harness.repository.getAlarm("owner-left")?.status === "PLAYING") break;
+            await new Promise<void>((resolve) => setImmediate(resolve));
         }
+        assert.equal(harness.repository.getAlarm("owner-left")?.status, "PLAYING");
+        let settled = false;
+        const leaving = harness.runtime.ownerVoiceChanged(null).then(() => { settled = true; });
+        await saving.promise;
+        assert.equal(settled, false);
+        assert.equal(harness.runtime.isIdle, false);
+        release.resolve();
+        await leaving;
+        assert.equal(harness.repository.getAlarm("owner-left")?.stopReason, "OWNER_LEFT");
+        assert.equal(harness.runtime.isIdle, true);
+    } finally {
+        release.resolve();
+        await harness.close();
     }
-});
-
-test("試聴検索中の発火は試聴を取消してアラームを優先する", async () => {
-    const first = deferred<BaseGuildVoiceChannel | null>();
-    const firstLookupStarted = deferred<void>();
-    let calls = 0;
-    const harness = makeHarness(() => {
-        if (++calls === 1) {
-            firstLookupStarted.resolve();
-            return first.promise;
-        }
-        return Promise.resolve(null);
-    });
-    harness.reserve("alarm-2", 1_001_000);
-    await harness.runtime.start([]);
-    const preview = harness.runtime.startPreview(video, textChannelId);
-    await firstLookupStarted.promise;
-    harness.setClock(1_001_000);
-    harness.setReady(true);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    first.resolve(harness.channel);
-    assert.equal((await preview).kind, "busy");
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-        if (harness.repository.getAlarm("alarm-2")?.stopReason === "OWNER_NOT_IN_VOICE") break;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    assert.equal(harness.repository.getAlarm("alarm-2")?.stopReason, "OWNER_NOT_IN_VOICE");
-    assert.equal(harness.connectedCount, 0);
-    await harness.close();
 });
 
 test("実際のPlaying到達時刻をDBへ保存する", async () => {
@@ -570,44 +464,6 @@ test("通知送信が保留中でも音源失敗を処理し再生時間を守�
         releaseNotification.resolve();
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(harness.runtime.isIdle, true);
-        await harness.close();
-    }
-});
-
-test("試聴失敗の通知が終わるまで完了待ちを続ける", async () => {
-    const notificationStarted = deferred<void>();
-    const releaseNotification = deferred<void>();
-    let delivered = false;
-    const media: MediaFactory = {
-        createYouTube: () => { throw new Error("音源を取得できません。"); },
-        createFallback: () => { throw new Error("代替音を取得できません。"); },
-    };
-    let voiceChannel: BaseGuildVoiceChannel;
-    const harness = makeHarness(async () => voiceChannel, true, Promise.resolve(), {
-        media,
-        sendNotification: async () => {
-            notificationStarted.resolve();
-            await releaseNotification.promise;
-            delivered = true;
-        },
-    });
-    voiceChannel = harness.channel;
-    try {
-        await harness.runtime.start([]);
-        assert.equal((await harness.runtime.startPreview(video, textChannelId)).kind, "started");
-        await notificationStarted.promise;
-        assert.equal(harness.runtime.isIdle, false);
-        let shutdownFinished = false;
-        const shutdown = harness.runtime.shutdown().then(() => { shutdownFinished = true; });
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(shutdownFinished, false);
-        releaseNotification.resolve();
-        await shutdown;
-        assert.equal(delivered, true);
-        assert.equal(harness.notifications.includes("試聴の音声再生に失敗しました。"), true);
-        assert.equal(harness.runtime.isIdle, true);
-    } finally {
-        releaseNotification.resolve();
         await harness.close();
     }
 });

@@ -34,7 +34,6 @@ function parseOptions(args: string[], allowed: string[]): Record<string, string>
 }
 
 function openRepository(): AlarmRepository {
-    if (process.env.ALARM_REMOTE_D1 === "1") throw new Error("ローカルCLIにはSQLiteの設定が必要です。");
     return new AlarmRepository(config.databasePath);
 }
 

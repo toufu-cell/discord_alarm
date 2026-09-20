@@ -64,7 +64,7 @@ test("音源取得が先に終わっても実音声の残りを再生する", as
     };
     const controller = new PlaybackController(media, voice.connector);
     const completion = controller.start({
-        runId: "buffered-audio", mode: "alarm", channel: "voice", videoUrl: "video",
+        runId: "buffered-audio", channel: "voice", videoUrl: "video",
         durationMs: 5_000, mediaTimeoutMs: 100,
     });
     try {
@@ -114,7 +114,7 @@ test("実音声と内蔵音が途中で止まった場合は失敗として終�
     };
     const controller = new PlaybackController(media, voice.connector);
     const completion = controller.start({
-        runId: "stalled-audio", mode: "alarm", channel: "voice", videoUrl: "video",
+        runId: "stalled-audio", channel: "voice", videoUrl: "video",
         durationMs: 10_000, mediaTimeoutMs: 100,
     });
     try {

@@ -32,7 +32,6 @@ test("設定値の範囲とYouTube動画IDを検証する", () => {
     const config = loadConfig({}, { requireDiscord: false });
     assert.equal(config.volumePercent, 35);
     assert.equal(config.snoozeLimit, 3);
-    assert.equal(config.previewSeconds, 30);
     assert.throws(() => loadConfig({ ALARM_VOLUME_PERCENT: "101" }, { requireDiscord: false }), /ALARM_VOLUME_PERCENT/);
     assert.throws(() => loadConfig({ ALARM_TIME_ZONE: "Invalid/Zone" }, { requireDiscord: false }), /ALARM_TIME_ZONE/);
     assert.equal(
